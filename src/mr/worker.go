@@ -1,16 +1,22 @@
 package mr
 
-import "fmt"
-import "log"
-import "net/rpc"
-import "hash/fnv"
-import "os"
-
+import (
+	"cmp"
+	"encoding/json"
+	"fmt"
+	"hash/fnv"
+	"io"
+	"log"
+	"net/rpc"
+	"os"
+	"slices"
+	"time"
+)
 
 // Map functions return a slice of KeyValue.
 type KeyValue struct {
-	Key   string
-	Value string
+	Key   string `json:"Key"`
+	Value string `json:"Value"`
 }
 
 // use ihash(key) % NReduce to choose the reduce
@@ -23,7 +29,6 @@ func ihash(key string) int {
 
 var coordSockName string // socket for coordinator
 
-
 // main/mrworker.go calls this function.
 func Worker(sockname string, mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
@@ -31,9 +36,39 @@ func Worker(sockname string, mapf func(string, string) []KeyValue,
 	coordSockName = sockname
 
 	// Your worker implementation here.
+	for {
+		reply := &GetTaskReply{}
+		arg := &GetTaskArgs{}
+		state := call("Coordinator.GetTask", arg, reply)
 
-	// uncomment to send the Example RPC to the coordinator.
-	// CallExample()
+		if !state || reply.TaskType == task_type(EXIT) {
+			return
+		}
+
+		switch reply.TaskType {
+
+		case task_type(MAP):
+			doMapTask(reply, mapf)
+
+			reportArg := &ReportTaskArgs{TaskType: reply.TaskType, TaskID: reply.TaskID}
+			reportReply := &ReportTaskReply{}
+
+			call("Coordinator.ReportTask", reportArg, reportReply)
+
+		case task_type(REDUCE):
+			doReduceTask(reply, reducef)
+
+			reportArg := &ReportTaskArgs{TaskType: reply.TaskType, TaskID: reply.TaskID}
+			reportReply := &ReportTaskReply{}
+
+			call("Coordinator.ReportTask", reportArg, reportReply)
+
+		case task_type(WAIT):
+			time.Sleep(time.Second)
+			continue
+		}
+
+	}
 
 }
 
@@ -80,4 +115,101 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 	}
 	log.Printf("%d: call failed err %v", os.Getpid(), err)
 	return false
+}
+
+func doMapTask(reply *GetTaskReply, mapf func(string, string) []KeyValue) {
+
+	data, err := os.ReadFile(reply.Filename)
+
+	if err != nil {
+		return
+	}
+
+	key_value := mapf(reply.Filename, string(data))
+	bucket := make([][]KeyValue, reply.NReduce)
+
+	for _, val := range key_value {
+		i := ihash(val.Key) % reply.NReduce
+		bucket[i] = append(bucket[i], val)
+	}
+
+	for i := 0; i < reply.NReduce; i++ {
+		tmpFile, err := os.CreateTemp("", "mr-temp-*")
+
+		if err != nil {
+			return
+		}
+
+		encoder := json.NewEncoder(tmpFile)
+		for _, v := range bucket[i] {
+			encoder.Encode(&v)
+		}
+
+		tmpFile.Close()
+		os.Rename(tmpFile.Name(), fmt.Sprintf("mr-%d-%d", reply.TaskID, i))
+	}
+}
+
+func doReduceTask(reply *GetTaskReply, reducef func(string, []string) string) {
+
+	kva := []KeyValue{}
+
+	for i := 0; i < reply.NMap; i++ {
+		fileName := fmt.Sprintf("mr-%v-%v", i, reply.TaskID)
+
+		file, err := os.Open(fileName)
+
+		if err != nil {
+			return
+		}
+		decoder := json.NewDecoder(file)
+
+		for decoder.More() {
+			var k KeyValue
+			err := decoder.Decode(&k)
+
+			if err != nil {
+				if err == io.EOF {
+					break
+				}
+				log.Fatal(err)
+			}
+			kva = append(kva, k)
+		}
+
+		file.Close()
+	}
+
+	slices.SortFunc(kva, func(a, b KeyValue) int {
+		return cmp.Compare(a.Key, b.Key)
+	})
+
+	tmpFile, err := os.CreateTemp("", "mr-out-tmp-*")
+
+	if err != nil {
+		return
+	}
+
+	i := 0
+	for i < len(kva) {
+
+		j := i + 1
+		for j < len(kva) && kva[j].Key == kva[i].Key {
+			j++
+		}
+
+		temp_kva := []string{}
+
+		for idx := i; idx < j; idx++ {
+			temp_kva = append(temp_kva, kva[idx].Value)
+		}
+
+		output := reducef(kva[i].Key, temp_kva)
+
+		tmpFile.WriteString(fmt.Sprintf("%v %v\n", kva[i].Key, output))
+		i = j
+	}
+	tmpFile.Close()
+	os.Rename(tmpFile.Name(), fmt.Sprintf("mr-out-%v", reply.TaskID))
+
 }
